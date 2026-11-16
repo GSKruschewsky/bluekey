@@ -1,6 +1,28 @@
 
 # Bluekey
 
+> **About this fork.** It adds Android support and a one-key toggle for controlling your phone from a Linux PC:
+> press **Super+M** and this PC's keyboard and mouse work on the phone, press **Super+Esc** and they're back. Think
+> Samsung Multi Control, for Linux, over plain Bluetooth.
+>
+> **Setup guide: [phone-control/README.md](phone-control/README.md)**
+>
+> Changes from [upstream](https://github.com/olbyolby/bluekey):
+>
+> - **Works with Android.** Keyboard and mouse are served as one composite HID service (Report IDs 1 and 2). Android
+>   only binds the first HID service a device has, so with two services phones got only the mouse or only the keyboard.
+> - **Survives reconnections.** Input reports use BlueZ's `StartNotify` instead of `AcquireNotify`. A bonded phone
+>   doesn't subscribe again when it reconnects, and the acquired socket died with the old connection, so input used to
+>   stop silently after any reconnect.
+> - **Bonds properly.** HID characteristics require encryption, so the phone pairs before using them and reconnects
+>   under its permanent address. The advertisement carries the PC's name, since phones hide nameless LE devices.
+> - **Comes back after power cycles.** Advertising is registered again whenever the adapter powers on (suspend,
+>   toggling Bluetooth), so a bonded phone always has something to reconnect to.
+> - **Smoother pointer.** Mouse reports with no movement are no longer sent 33 times a second.
+> - **`bluekey bridge` works without a terminal**, for keyboard shortcuts: it runs until the escape shortcut
+>   instead of quitting on the end of its (empty) input.
+> - **Fixes** the D-Bus activation file, which pointed at `bluekey.service` instead of `bluekeyd.service`.
+
 Bluekey is a command line utility enabling a computer to act as a Bluetooth keyboard and mouse, allowing a single keyboard and mouse to be used with any number of devices supporting Bluetooth.
 
 Bluekey operates as a system daemon, accessible via DBus, enabling multiple keyboards or mice to be bridged to multiple Bluetooth clients.

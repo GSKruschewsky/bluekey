@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Hand this PC's keyboard and mouse to your phone, until you press bluekey's escape shortcut (Super+Esc by default).
+# Bind it to a key with install-user.sh. Settings live in ~/.config/bluekey/phone-control.conf
+# (see phone-control.conf.example).
+set -u
+
+CONFIG=${PHONE_CONTROL_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/bluekey/phone-control.conf}
+
+notify() { command -v notify-send >/dev/null && notify-send "$@"; return 0; }
+fail() {
+    echo "phone-control: $1" >&2
+    notify -i dialog-error "Phone control" "$1"
+    exit 1
+}
+
+[ -r "$CONFIG" ] || fail "No config at $CONFIG (start from phone-control.conf.example)"
+PHONE='' KEYBOARD='' MOUSE='' BLUEKEY=''
+# shellcheck source=phone-control.conf.example
+. "$CONFIG"
+
+[ -n "$PHONE" ] || fail "PHONE is not set in $CONFIG"
+# The escape shortcut is read from the keyboard, so a mouse-only bridge could never be escaped
+[ -n "$KEYBOARD" ] || fail "KEYBOARD is not set in $CONFIG"
+[ -e "$KEYBOARD" ] || fail "Keyboard $KEYBOARD not found (unplugged?)"
+[ -z "$MOUSE" ] || [ -e "$MOUSE" ] || fail "Mouse $MOUSE not found (unplugged?)"
+if [ -z "$BLUEKEY" ]; then
+    BLUEKEY=$(command -v bluekey || echo /usr/local/bin/bluekey)
+fi
+
+# One bridge at a time: pressing the shortcut again while bridged does nothing
+exec 9>"${XDG_RUNTIME_DIR:-/tmp}/phone-control.lock"
+flock -n 9 || exit 0
+
+# Never grab the keyboard if nothing is there to receive it
+if ! bluetoothctl info "$PHONE" 2>/dev/null | grep -q 'Connected: yes'; then
+    fail "Phone not connected. Is bluekeyd running and the phone's Bluetooth on?"
+fi
+
+# Let go of the shortcut's keys before the grab, so the desktop sees them released
+sleep 0.4
+
+escape=$("$BLUEKEY" escape-shortcut 2>/dev/null | sed -n 's/^Keyboard shortcut is: //p')
+notify -i input-keyboard -t 2000 "Controlling phone" "${escape:-The escape shortcut} to come back"
+
+args=(bridge --keyboard "$KEYBOARD" --mac "$PHONE")
+[ -z "$MOUSE" ] || args+=(--mouse "$MOUSE")
+# Without a terminal, bluekey bridge runs until the escape shortcut (or an error) ends it
+error=$("$BLUEKEY" "${args[@]}" 2>&1 >/dev/null </dev/null)
+status=$?
+
+if [ $status -ne 0 ]; then
+    fail "bluekey bridge failed: ${error:-exit status $status}"
+fi
+notify -i computer -t 1500 "Back on the PC"

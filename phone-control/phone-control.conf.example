@@ -1,0 +1,16 @@
+# phone-control settings. install-user.sh copies this to ~/.config/bluekey/phone-control.conf
+# and fills in whatever it can detect. Shell syntax: no spaces around '='.
+
+# Your phone's Bluetooth address. After pairing, `bluekey list` prints it.
+PHONE=AA:BB:CC:DD:EE:FF
+
+# The keyboard to hand over (required: the escape shortcut is read from it).
+# Use a stable name, they survive reboots and replugging: ls /dev/input/by-id/ | grep event-kbd
+# A laptop's built-in keyboard is under /dev/input/by-path/ instead (often platform-i8042-serio-0-event-kbd).
+KEYBOARD=/dev/input/by-id/usb-Your_Keyboard-event-kbd
+
+# The mouse to hand over (optional): ls /dev/input/by-id/ | grep event-mouse
+MOUSE=/dev/input/by-id/usb-Your_Mouse-event-mouse
+
+# Path to the bluekey client, if it isn't on PATH (default: bluekey, else /usr/local/bin/bluekey)
+#BLUEKEY=/usr/local/bin/bluekey
