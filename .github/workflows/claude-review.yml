@@ -1,0 +1,115 @@
+name: Claude PR Review
+
+# Claude Opus 5.5 reads each pull request and looks only for problems that should
+# block the merge. It posts one comment on the PR (edited in place on later pushes)
+# and fails the check when it finds a blocker.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    name: Claude merge review
+    # Skip drafts, and PRs from forks: GitHub gives fork PRs no secrets.
+    if: >-
+      !github.event.pull_request.draft &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out the PR
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Review with Claude Opus 5.5
+        id: review
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          prompt: |
+            You are reviewing pull request #${{ github.event.pull_request.number }} in ${{ github.repository }}.
+            bluekey is a Rust project (Cargo workspace) that turns a Linux machine into a
+            Bluetooth keyboard and mouse for other devices.
+
+            Run `gh pr view ${{ github.event.pull_request.number }}` and
+            `gh pr diff ${{ github.event.pull_request.number }}` to see the change. The PR's
+            code is checked out in the working directory: read the surrounding code before
+            you judge a change.
+
+            Report ONLY problems that should block this merge:
+            - bugs: wrong behaviour, crashes, panics, data loss, broken edge cases
+            - security problems
+            - regressions: something that worked before and breaks with this change
+            - code that will not compile or is clearly unfinished
+
+            Do NOT report style, naming, formatting, missing tests, docs, or "nice to have"
+            refactors. If you are not confident something is a real problem, leave it out.
+            An empty list is the right answer for a good PR.
+
+            For each blocker give the file, the line in the new code when there is one, a
+            short title, and an explanation of what goes wrong and when. Then write a
+            one or two sentence summary of the PR.
+          claude_args: |
+            --model claude-opus-5-5
+            --permission-mode default
+            --allowedTools "Read,Grep,Glob,Bash(gh pr view:*),Bash(gh pr diff:*)"
+            --json-schema '{"type":"object","properties":{"summary":{"type":"string"},"blocking_issues":{"type":"array","items":{"type":"object","properties":{"file":{"type":"string"},"line":{"type":"integer"},"title":{"type":"string"},"explanation":{"type":"string"}},"required":["file","title","explanation"]}}},"required":["summary","blocking_issues"]}'
+
+      - name: Post the review on the PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULT: ${{ steps.review.outputs.structured_output }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ -z "$RESULT" ]; then
+            echo '::error::Claude returned no review.'
+            exit 1
+          fi
+
+          marker='<!-- claude-pr-review -->'
+          count=$(jq '.blocking_issues | length' <<<"$RESULT")
+          body=$(jq -r --arg marker "$marker" --arg sha "${HEAD_SHA:0:7}" '
+            $marker,
+            (if (.blocking_issues | length) > 0
+              then "## 🛑 Claude review: \(.blocking_issues | length) merge blocker(s)"
+              else "## ✅ Claude review: no merge blockers" end),
+            "",
+            .summary,
+            (.blocking_issues[] |
+              "",
+              "### \(.title)",
+              "`\(.file)\(if .line then ":\(.line)" else "" end)`",
+              "",
+              .explanation),
+            "",
+            "<sub>Claude Opus 5.5 · reviewed commit \($sha)</sub>"
+          ' <<<"$RESULT")
+
+          # Edit the earlier review comment if there is one, so each push doesn't add another.
+          comment_id=$(gh api --paginate "repos/$REPO/issues/$PR/comments" \
+            --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$marker\"))) | .id" \
+            | sed -n 1p)
+          if [ -n "$comment_id" ]; then
+            gh api --method PATCH "repos/$REPO/issues/comments/$comment_id" -f body="$body" > /dev/null
+          else
+            gh api --method POST "repos/$REPO/issues/$PR/comments" -f body="$body" > /dev/null
+          fi
+
+          if [ "$count" -gt 0 ]; then
+            echo "::error::Claude found $count merge blocker(s). See the review comment on the PR."
+            exit 1
+          fi
