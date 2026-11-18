@@ -122,7 +122,8 @@ first: `./phone-control/install-user.sh --check '<Super><Alt>p'`.
 ### 6. Try it
 
 Press **Super+M**: a "Controlling phone" notification appears, and the keyboard and mouse now work on the phone.
-**Super+Esc** brings them back ("Back on the PC").
+**Super+Esc** brings them back ("Back on the PC"). The phone never sees Super+Esc, so whatever is on its screen (a 2FA
+code, a message) stays there while you type it on the PC.
 
 To change the way back: `bluekey escape-shortcut LEFTCTRL+LEFTALT+ESC` (evdev key names joined with `+`). This lasts
 until bluekeyd restarts.
