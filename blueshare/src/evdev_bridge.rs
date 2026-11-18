@@ -78,17 +78,17 @@ impl Shortcut {
         }
     }
 
-    fn pressed(&mut self, keycode: KeyCode) -> bool {
+    fn pressed(&mut self, keycode: KeyCode) -> Match {
         if self.active[self.progress] == keycode {
             self.progress += 1;
 
             if self.progress == self.active.len() {
                 self.progress = 0;
-                return true
-            } 
-            return false
-        } 
-        return false
+                return Match::Complete
+            }
+            return Match::Partial
+        }
+        Match::No
     }
     fn released(&mut self, keycode: KeyCode) {
         if self.active[..=self.progress].contains(&keycode) {
@@ -102,6 +102,85 @@ impl Shortcut {
 
     pub fn keys(&self) -> &[KeyCode] {
         &self.active
+    }
+}
+
+/// What a key press does to the escape shortcut
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Match {
+    /// It's the next key of the shortcut, but more are needed
+    Partial,
+    /// It's the shortcut's last key
+    Complete,
+    /// It isn't the next key of the shortcut
+    No
+}
+
+/// Keeps the escape shortcut from reaching the target. A press that matches the shortcut so far is held back until a
+/// later key shows whether the shortcut is being typed: if it's completed, the target never sees any of it, otherwise
+/// the held presses are sent first. Forwarding them straight away made Super+Esc reach the target as a lone Super tap,
+/// which Android takes as "open the app drawer", leaving whatever app was on screen.
+#[derive(Debug)]
+struct EscapeFilter {
+    shortcut: Shortcut,
+    /// Presses matching the shortcut so far, not sent yet
+    held: Vec<KeyCode>
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Filtered {
+    /// Send these on, in order(true for a press, false for a release)
+    Send(Vec<(KeyCode, bool)>),
+    /// The shortcut was completed. These keys of it reached the target and need releasing there
+    Escaped(Vec<KeyCode>)
+}
+
+impl EscapeFilter {
+    fn new(shortcut: Shortcut) -> Self {
+        Self {
+            shortcut,
+            held: Vec::new()
+        }
+    }
+
+    /// Takes an evdev key event's value: 1 for a press, 0 for a release, 2 for a repeat(ignored)
+    fn key(&mut self, code: KeyCode, action: i32) -> Filtered {
+        match action {
+            1 => match self.shortcut.pressed(code) {
+                Match::Complete => {
+                    let held = std::mem::take(&mut self.held);
+                    Filtered::Escaped(self.shortcut.keys().iter()
+                        .filter(|key| **key != code && !held.contains(key))
+                        .copied()
+                        .collect())
+                },
+                Match::Partial => {
+                    self.held.push(code);
+                    Filtered::Send(Vec::new())
+                },
+                Match::No => {
+                    let mut send = self.take_held();
+                    send.push((code, true));
+                    Filtered::Send(send)
+                }
+            },
+            0 => {
+                self.shortcut.released(code);
+                // Once the shortcut is abandoned, what was held back is just keys being used
+                let mut send = match self.shortcut.progress {
+                    0 => self.take_held(),
+                    _ => Vec::new()
+                };
+                send.push((code, false));
+                Filtered::Send(send)
+            },
+            _ => Filtered::Send(Vec::new())
+        }
+    }
+
+    /// The held presses, to send now, in the order they happened
+    fn take_held(&mut self) -> Vec<(KeyCode, bool)> {
+        self.held.drain(..).map(|key| (key, true)).collect()
     }
 }
 
@@ -155,8 +234,9 @@ impl Drop for KeyboardBridge {
 }
 
 
-async fn evdev_keyboard_bridge<T: Borrow<Keyboard> + Send + 'static>(keyboard: T, mut device: EventStream, target: Target, mut cancel: oneshot::Receiver<Cancel>, mut escape: Shortcut) -> Result<BreakReason, EvdevBridgeError> { 
+async fn evdev_keyboard_bridge<T: Borrow<Keyboard> + Send + 'static>(keyboard: T, mut device: EventStream, target: Target, mut cancel: oneshot::Receiver<Cancel>, escape: Shortcut) -> Result<BreakReason, EvdevBridgeError> {
     let keyboard = keyboard.borrow();
+    let mut escape = EscapeFilter::new(escape);
 
     let mut returns = match target {
         Target::Target(target) => Some(target),
@@ -180,30 +260,21 @@ async fn evdev_keyboard_bridge<T: Borrow<Keyboard> + Send + 'static>(keyboard: T
         tokio::select! {
             event = device.next_event() => {
                 if let EventSummary::Key(_, code, action) = event?.destructure() {
-                    match action {
-                        0 => escape.released(code),
-                        1 => if escape.pressed(code) {
-                            for key in escape.keys().iter() {
-                                if let Ok(code) = keycode::KeyMap::try_from(keycode::KeyMapping::Evdev(key.0)) {
-                                    keyboard.release(target, code.usb as u8).await?
-                                }
+                    match escape.key(code, action) {
+                        Filtered::Escaped(sent) => {
+                            for code in sent.into_iter().filter_map(usb_code) {
+                                keyboard.release(target, code).await?
                             }
                             break Ok(BreakReason::Escaped)
                         },
-                        _ => ()
+                        Filtered::Send(keys) => for (code, pressed) in keys {
+                            let Some(code) = usb_code(code) else { continue };
+                            match pressed {
+                                true => keyboard.press(target, code).await?,
+                                false => keyboard.release(target, code).await?
+                            }
+                        }
                     }
-
-                    let map = match keycode::KeyMap::from_key_mapping(keycode::KeyMapping::Evdev(code.0)) {
-                        Ok(map) => map,
-                        Err(_) => continue
-                    };
-                    let code: u8 = map.usb.try_into().expect("USB scancode is always 8 bits");
-                    match action {
-                        0 => keyboard.release(target,code).await?,
-                        1 => keyboard.press(target, code).await?,
-                        _ => ()
-                    };
-                    
                 }
             },
             event = keyboard_events.next_event() => if let Some(target) = returns {
@@ -217,6 +288,11 @@ async fn evdev_keyboard_bridge<T: Borrow<Keyboard> + Send + 'static>(keyboard: T
             _ = &mut cancel => return Ok(BreakReason::Cancelled)
         }
     }
+}
+/// The USB HID usage for an evdev key, if it has one
+fn usb_code(key: KeyCode) -> Option<u8> {
+    let map = keycode::KeyMap::from_key_mapping(keycode::KeyMapping::Evdev(key.0)).ok()?;
+    Some(map.usb.try_into().expect("USB scancode is always 8 bits"))
 }
 fn set_led(device: &mut Device, led: Led, on: bool) -> Result<(), std::io::Error> {
     let on = match on {
@@ -366,4 +442,97 @@ async fn evdev_mouse_bridge<T: Borrow<Mouse> + Send + 'static>(mouse: T, mut dev
         }
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SUPER: KeyCode = KeyCode::KEY_LEFTMETA;
+    const ESC: KeyCode = KeyCode::KEY_ESC;
+    const TAB: KeyCode = KeyCode::KEY_TAB;
+    const A: KeyCode = KeyCode::KEY_A;
+
+    fn filter(keys: &[KeyCode]) -> EscapeFilter {
+        EscapeFilter::new(SharedShortcut::new(Arc::new(keys.to_vec())).shortcut())
+    }
+    fn press(filter: &mut EscapeFilter, key: KeyCode) -> Filtered {
+        filter.key(key, 1)
+    }
+    fn release(filter: &mut EscapeFilter, key: KeyCode) -> Filtered {
+        filter.key(key, 0)
+    }
+    fn send(keys: &[(KeyCode, bool)]) -> Filtered {
+        Filtered::Send(keys.to_vec())
+    }
+
+    #[test]
+    fn the_target_never_sees_the_shortcut() {
+        let mut escape = filter(&[SUPER, ESC]);
+        assert_eq!(press(&mut escape, SUPER), send(&[]));
+        assert_eq!(escape.key(SUPER, 2), send(&[])); // Holding Super repeats it
+        assert_eq!(press(&mut escape, ESC), Filtered::Escaped(vec![]));
+    }
+
+    #[test]
+    fn a_lone_super_tap_still_reaches_the_target() {
+        let mut escape = filter(&[SUPER, ESC]);
+        assert_eq!(press(&mut escape, SUPER), send(&[]));
+        assert_eq!(release(&mut escape, SUPER), send(&[(SUPER, true), (SUPER, false)]));
+    }
+
+    #[test]
+    fn other_super_shortcuts_reach_the_target_in_order() {
+        let mut escape = filter(&[SUPER, ESC]);
+        assert_eq!(press(&mut escape, SUPER), send(&[]));
+        assert_eq!(press(&mut escape, TAB), send(&[(SUPER, true), (TAB, true)]));
+        assert_eq!(release(&mut escape, TAB), send(&[(TAB, false)]));
+        assert_eq!(release(&mut escape, SUPER), send(&[(SUPER, false)]));
+    }
+
+    #[test]
+    fn escaping_after_another_super_shortcut_releases_super_on_the_target() {
+        let mut escape = filter(&[SUPER, ESC]);
+        press(&mut escape, SUPER);
+        assert_eq!(press(&mut escape, TAB), send(&[(SUPER, true), (TAB, true)]));
+        assert_eq!(release(&mut escape, TAB), send(&[(TAB, false)]));
+        assert_eq!(press(&mut escape, ESC), Filtered::Escaped(vec![SUPER]));
+    }
+
+    #[test]
+    fn keys_outside_the_shortcut_pass_straight_through() {
+        let mut escape = filter(&[SUPER, ESC]);
+        assert_eq!(press(&mut escape, A), send(&[(A, true)]));
+        assert_eq!(escape.key(A, 2), send(&[]));
+        assert_eq!(release(&mut escape, A), send(&[(A, false)]));
+        // Esc on its own isn't the shortcut
+        assert_eq!(press(&mut escape, ESC), send(&[(ESC, true)]));
+        assert_eq!(release(&mut escape, ESC), send(&[(ESC, false)]));
+    }
+
+    #[test]
+    fn abandoning_the_shortcut_sends_what_was_held() {
+        let mut escape = filter(&[SUPER, ESC]);
+        // Esc held down on the target, then Super pressed and Esc let go: Esc can't complete the shortcut anymore
+        assert_eq!(press(&mut escape, ESC), send(&[(ESC, true)]));
+        assert_eq!(press(&mut escape, SUPER), send(&[]));
+        assert_eq!(release(&mut escape, ESC), send(&[(SUPER, true), (ESC, false)]));
+        assert_eq!(release(&mut escape, SUPER), send(&[(SUPER, false)]));
+    }
+
+    #[test]
+    fn longer_shortcuts_hold_every_key_until_completed_or_abandoned() {
+        let ctrl = KeyCode::KEY_LEFTCTRL;
+        let alt = KeyCode::KEY_LEFTALT;
+        let mut escape = filter(&[ctrl, alt, ESC]);
+        assert_eq!(press(&mut escape, ctrl), send(&[]));
+        assert_eq!(press(&mut escape, alt), send(&[]));
+        assert_eq!(press(&mut escape, ESC), Filtered::Escaped(vec![]));
+
+        let mut escape = filter(&[ctrl, alt, ESC]);
+        press(&mut escape, ctrl);
+        press(&mut escape, alt);
+        assert_eq!(release(&mut escape, alt), send(&[(ctrl, true), (alt, true), (alt, false)]));
+        assert_eq!(release(&mut escape, ctrl), send(&[(ctrl, false)]));
+    }
 }

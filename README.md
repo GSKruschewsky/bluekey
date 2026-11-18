@@ -21,6 +21,9 @@
 > - **Smoother pointer.** Mouse reports with no movement are no longer sent 33 times a second.
 > - **`bluekey bridge` works without a terminal**, for keyboard shortcuts: it runs until the escape shortcut
 >   instead of quitting on the end of its (empty) input.
+> - **The escape shortcut stays on the PC.** Its keys used to reach the device as they were typed, so Super+Esc arrived
+>   on Android as a lone Super tap, which opens the app drawer over whatever app was open. A key that could start the
+>   shortcut is now held back until the next key shows whether it does.
 > - **Fixes** the D-Bus activation file, which pointed at `bluekey.service` instead of `bluekeyd.service`.
 
 Bluekey is a command line utility enabling a computer to act as a Bluetooth keyboard and mouse, allowing a single keyboard and mouse to be used with any number of devices supporting Bluetooth.
